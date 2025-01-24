@@ -6,111 +6,196 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 )
 
 type GraphQLRequest struct {
-	Query     string `json:"query"`
+	Query string `json:"query"`
 }
 
 func main() {
-	var (
-		file string
-		vars string
-		endpoint string
-		token string
-		showHeaders bool
-		showRaw bool
-	)
+	debug := flag.Bool("debug", false, "Enable debug logging")
 
-	flag.StringVar(&file, "file", "", "Path to the graphql query file (required)")
-	flag.StringVar(&vars, "vars", "", "Path to the graphql variables file")
-	flag.StringVar(&endpoint, "endpoint", "", "GraphQL endpoint to run the query against, can be set with the ENDPOINT environment variable")
-	flag.StringVar(&token, "token", "", "Bearer token to use for authentication")
-	flag.BoolVar(&showHeaders, "show-headers", false, "Show response headers")
-	flag.BoolVar(&showRaw, "show-raw", false, "Show raw response body, including headers")
 	flag.Parse()
 
-	if file == "" {
-		fmt.Println("Missing required arguments: file")
-		flag.Usage()
-		os.Exit(1)
+	logLevel := slog.LevelInfo
+	if debug != nil && *debug {
+		logLevel = slog.LevelDebug
 	}
 
-	if endpoint == "" {
-		endpoint = os.Getenv("ENDPOINT")
-		if endpoint == "" {
-			fmt.Println("Missing required arguments: endpoint")
-			flag.Usage()
-			os.Exit(1)
-		}
-	}
+	var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
 
-	query, err := os.ReadFile(file)
-	if err != nil {
-		fmt.Println("Error reading query file:", err)
-		os.Exit(1)
-	}
+	logger.Debug(fmt.Sprintf("Flag -debug %v", *debug))
 
-	reqBody := &GraphQLRequest{
-		Query: string(query),
-	}
+	args := flag.Args()
 
-	reqBodyJSON, err := json.Marshal(reqBody)
-	if err != nil {
-		fmt.Println("Error encoding request body:", err)
-		os.Exit(1)
-	}
+	switch args[0] {
+	case "gql":
+		fs := flag.NewFlagSet("gql", flag.ExitOnError)
+		query := fs.String("query", "", "String query for the GraphQL request")
+		file := fs.String("file", "", "Path to a file containing the query for the GraphQL request")
+		token := fs.String("token", "", "Bearer token to use for authentication")
+		raw := fs.Bool("raw", false, "Show raw response body, including headers")
 
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(reqBodyJSON))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		os.Exit(1)
-	}
+		fs.Parse(args[1:])
 
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer " + token)
-	}
+		logger.Debug(fmt.Sprintf("Flag -token %s", *token))
+		logger.Debug(fmt.Sprintf("Flag -query %s", *query))
+		logger.Debug(fmt.Sprintf("Flag -file %s", *file))
+		logger.Debug(fmt.Sprintf("Flag -raw %v", *raw))
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error making request:", err)
-		os.Exit(1)
-	}
-
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response body:", err)
-		os.Exit(1)
-	}
-
-	if showRaw {
-		rawResp := bytes.Buffer{}
-		rawResp.WriteString(fmt.Sprintf("%s %s\n", resp.Proto, resp.Status))
-		for k, v := range resp.Header {
-			rawResp.WriteString(fmt.Sprintf("%s: %s\n", k, v))
-		}
-		rawResp.WriteString("\n")
-		rawResp.Write(body)
-		fmt.Println(rawResp.String())
-	} else {
-		var prettyJSON bytes.Buffer
-		if err := json.Indent(&prettyJSON, body, "", "  "); err != nil {
-			fmt.Println("Error pretty-printing JSON:", err)
+		url, err := url.Parse(args[len(args)-1])
+		if err != nil {
+			logger.Error("Invalid URL")
 			os.Exit(1)
 		}
 
-		if showHeaders {
-			for k, v := range resp.Header {
-				fmt.Printf("%s: %s\n", k, v)
+		logger.Debug(fmt.Sprintf("URL %s", url))
+
+		client := &http.Client{}
+
+		var queryStr *string
+
+		switch {
+		case *query != "" && *file != "":
+			logger.Error("Cannot specify both query and file")
+			os.Exit(1)
+		case *file != "":
+			content, err := os.ReadFile(*file)
+			if err != nil {
+				logger.Error("Error reading query file", "error", err)
+				os.Exit(1)
 			}
-			fmt.Println()
+			logger.Debug("Read file content", "file", content)
+			value := string(content)
+			queryStr = &value
+		case *query != "":
+			queryStr = query
+		default:
+			logger.Error("Must provide either query and file")
+			os.Exit(1)
 		}
 
-		fmt.Println(prettyJSON.String())
+		reqBody := &GraphQLRequest{
+			Query: *queryStr,
+		}
+
+		reqBodyJSON, err := json.Marshal(reqBody)
+		if err != nil {
+			logger.Error("Error encoding request body", "error", err)
+			os.Exit(1)
+		}
+
+		req, err := http.NewRequest(http.MethodPost, url.String(), bytes.NewBuffer(reqBodyJSON))
+		if err != nil {
+			logger.Error("Error creating request", "error", err)
+			os.Exit(1)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		if *token != "" {
+			req.Header.Set("Authorization", "Bearer "+*token)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Error("Error making request", "error", err)
+			os.Exit(1)
+		}
+
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Error("Error reading response body", "error", err)
+			os.Exit(1)
+		}
+
+		if *raw {
+			rawResp := bytes.Buffer{}
+			rawResp.WriteString(fmt.Sprintf("%s %s\n", resp.Proto, resp.Status))
+			for k, v := range resp.Header {
+				rawResp.WriteString(fmt.Sprintf("%s: %s\n", k, v))
+			}
+			rawResp.WriteString("\n")
+			rawResp.Write(body)
+			fmt.Println(rawResp.String())
+		}
+
+	case "http":
+		fs := flag.NewFlagSet("http", flag.ExitOnError)
+		method := fs.String("method", "GET", "Method to do the request")
+		token := fs.String("token", "", "Bearer token to use for authentication")
+		raw := fs.Bool("raw", false, "Show raw response body, including headers")
+
+		fs.Parse(args[1:])
+
+		logger.Debug(fmt.Sprintf("Flag -method %s", *method))
+		logger.Debug(fmt.Sprintf("Flag -token %s", *token))
+		logger.Debug(fmt.Sprintf("Flag -raw %v", *raw))
+
+		url, err := url.Parse(args[len(args)-1])
+		if err != nil {
+			logger.Error("Invalid URL", "error", err)
+			os.Exit(1)
+		}
+		logger.Debug(fmt.Sprintf("URL %s", url))
+
+		req, err := http.NewRequest(http.MethodGet, url.String(), nil)
+		if err != nil {
+			logger.Error("Error making request", "error", err)
+			os.Exit(1)
+		}
+
+		client := http.Client{}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Error("Error making request", "error", err)
+			os.Exit(1)
+		}
+
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Error("Error reading response body", "error", err)
+			os.Exit(1)
+		}
+
+		if *raw {
+			rawResp := bytes.Buffer{}
+			rawResp.WriteString(fmt.Sprintf("%s %s\n", resp.Proto, resp.Status))
+			for k, v := range resp.Header {
+				rawResp.WriteString(fmt.Sprintf("%s: %s\n", k, v))
+			}
+			rawResp.WriteString("\n")
+			rawResp.Write(body)
+			fmt.Println(rawResp.String())
+		}
+	default:
+		logger.Info("Unknown command")
 	}
+
+	// if showRaw {
+	// } else {
+	// 	var prettyJSON bytes.Buffer
+	// 	if err := json.Indent(&prettyJSON, body, "", "  "); err != nil {
+	// 		fmt.Println("Error pretty-printing JSON:", err)
+	// 		os.Exit(1)
+	// 	}
+	//
+	// 	if showHeaders {
+	// 		for k, v := range resp.Header {
+	// 			fmt.Printf("%s: %s\n", k, v)
+	// 		}
+	// 		fmt.Println()
+	// 	}
+	//
+	// 	fmt.Println(prettyJSON.String())
+	// }
 }
